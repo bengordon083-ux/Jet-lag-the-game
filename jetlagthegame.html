@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live GPS Friends Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+<style>
+html, body {margin:0; padding:0; height:100%; font-family:Arial;}
+#map {width:100%; height:100%;}
+.controls{
+position:absolute; top:10px; left:10px; right:10px; background:white;
+padding:10px; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.3); z-index:1000;
+}
+.controls input, .controls button, .controls select{
+width:100%; padding:8px; margin:5px 0; border-radius:6px; border:1px solid #ccc;
+}
+button{background:#2b7cff; color:white; border:none; cursor:pointer;}
+button:hover{background:#1a5edb;}
+.friend-distance{
+background:#f1f1f1; padding:5px; border-radius:6px; margin-top:5px; max-height:200px; overflow-y:auto;
+}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div class="controls">
+<h3>Live GPS Map</h3>
+<button onclick="toggleMenu()">☰ Menu</button>
+
+<div id="menuContent" style="display:none; margin-top:10px;">
+  <input id="myId" placeholder="Your PeerJS ID">
+  <button onclick="connectPeer()">Start</button>
+
+  <h4>Add Friend by PeerJS ID</h4>
+  <input id="friendId" placeholder="Friend PeerJS ID">
+  <button onclick="connectToFriend()">Connect Friend</button>
+
+  <h4>Distance Circle</h4>
+  <select id="distanceCircle">
+    <option value="500">500 m</option>
+    <option value="1000">1 km</option>
+    <option value="2000">2 km</option>
+    <option value="5000">5 km</option>
+    <option value="10000">10 km</option>
+    <option value="15000">15 km</option>
+  </select>
+  <button onclick="updateCircle()">Show Distance Circle</button>
+
+  <h4>Visibility</h4>
+  <input type="checkbox" id="shareLocation" checked> Share My Location
+  <div id="friendVisibility"></div>
+</div>
+
+<p id="status"></p>
+<div class="friend-distance" id="friendDistances"></div>
+</div>
+
+<script>
+let map = L.map('map').setView([20,0],2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(map);
+
+let userMarker, circleLayer;
+let friendMarkers = {};
+let userLat, userLon;
+let peer;
+let friends = {};
+let friendIcons = {}; // Custom icon per friend
+
+// Your icon
+let myIcon = L.icon({
+    iconUrl: 'https://cdn-icons-png.flaticon.com/512/149/149071.png',
+    iconSize: [40, 40],
+    iconAnchor: [20, 40],
+    popupAnchor: [0, -35]
+});
+
+// Toggle menu
+function toggleMenu(){
+  const menu = document.getElementById('menuContent');
+  menu.style.display = (menu.style.display === 'none') ? 'block' : 'none';
+}
+
+// Generate custom icon per friend
+function getFriendIcon(id){
+  if(friendIcons[id]) return friendIcons[id];
+
+  const colors = ['ff4d4d','ffa500','32cd32','1e90ff','ff69b4','8a2be2'];
+  const color = colors[Object.keys(friendIcons).length % colors.length];
+
+  let icon = L.icon({
+    iconUrl: `https://via.placeholder.com/40/${color}/ffffff?text=${id.charAt(0).toUpperCase()}`,
+    iconSize: [40,40],
+    iconAnchor: [20,40],
+    popupAnchor: [0,-35]
+  });
+
+  friendIcons[id] = icon;
+  return icon;
+}
+
+// Watch user location
+function getLocation(){
+  if(navigator.geolocation){
+    navigator.geolocation.watchPosition(pos=>{
+      userLat = pos.coords.latitude;
+      userLon = pos.coords.longitude;
+
+      if(document.getElementById('shareLocation').checked){
+        if(userMarker){
+          userMarker.setLatLng([userLat,userLon]);
+        } else {
+          userMarker = L.marker([userLat,userLon], {icon: myIcon, title:"You"}).addTo(map);
+          map.setView([userLat,userLon],13);
+        }
+
+        // Send location to all friends
+        for(let id in friends){
+          if(friends[id].conn && friends[id].conn.open){
+            friends[id].conn.send({lat:userLat, lon:userLon});
+          }
+        }
+      } else if(userMarker){
+        map.removeLayer(userMarker);
+        userMarker = null;
+      }
+
+      updateFriendDistances();
+    }, err=>console.error(err), {enableHighAccuracy:true, maximumAge:3000});
+  } else alert("Geolocation not supported");
+}
+
+// Distance circle
+function updateCircle(){
+  let radius = parseInt(document.getElementById('distanceCircle').value);
+  if(circleLayer) map.removeLayer(circleLayer);
+  if(userLat && userLon){
+    circleLayer = L.circle([userLat,userLon],{
+      radius: radius,
+      color:'#2b7cff',
+      fillColor:'#2b7cff',
+      fillOpacity:0.1
+    }).addTo(map);
+  } else alert("Share your location first");
+}
+
+// PeerJS
+function connectPeer(){
+  let myId = document.getElementById('myId').value.trim();
+  if(!myId){ alert("Enter your PeerJS ID"); return; }
+  peer = new Peer(myId);
+  peer.on('open', id=>{
+    document.getElementById('status').innerText="Peer ready: "+id;
+    getLocation();
+  });
+  peer.on('connection', connection=>{
+    connection.on('data', data=>{
+      updateFriendMarker(connection.peer, data.lat, data.lon);
+    });
+    friends[connection.peer] = {conn:connection, visible:true};
+  });
+}
+
+// Connect to friend
+function connectToFriend(){
+  let friendId = document.getElementById('friendId').value.trim();
+  if(!friendId){ alert("Enter friend ID"); return; }
+  let connection = peer.connect(friendId);
+  connection.on('open', ()=>{document.getElementById('status').innerText="Connected to "+friendId;});
+  connection.on('data', data=>updateFriendMarker(friendId, data.lat, data.lon));
+  friends[friendId] = {conn:connection, visible:true};
+}
+
+// Update friend markers
+function updateFriendMarker(id, lat, lon){
+  if(friendMarkers[id]){
+    friendMarkers[id].setLatLng([lat,lon]);
+  } else {
+    friendMarkers[id] = L.marker([lat,lon], {icon: getFriendIcon(id), title:"Friend: "+id});
+    if(friends[id].visible) friendMarkers[id].addTo(map);
+  }
+  friends[id].lat = lat;
+  friends[id].lon = lon;
+  updateFriendVisibilityMenu();
+  updateFriendDistances();
+}
+
+// Friend visibility menu
+function updateFriendVisibilityMenu(){
+  const container = document.getElementById('friendVisibility');
+  container.innerHTML = '';
+  for(let id in friends){
+    let chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.checked = friends[id].visible;
+    chk.onchange = (e)=>{
+      friends[id].visible = e.target.checked;
+      updateFriendMarkers();
+    };
+    container.appendChild(chk);
+    container.appendChild(document.createTextNode(" " + id));
+    container.appendChild(document.createElement('br'));
+  }
+}
+
+// Show/hide friends on map
+function updateFriendMarkers(){
+  for(let id in friends){
+    if(friendMarkers[id]){
+      if(friends[id].visible) friendMarkers[id].addTo(map);
+      else map.removeLayer(friendMarkers[id]);
+    }
+  }
+  updateFriendDistances();
+}
+
+// Display distances
+function updateFriendDistances(){
+  let html='';
+  for(let id in friends){
+    if(friends[id].lat && friends[id].lon && userLat && userLon && friends[id].visible){
+      let d = distance(userLat,userLon,friends[id].lat,friends[id].lon);
+      html += id+": "+(d/1000).toFixed(2)+" km<br>";
+    }
+  }
+  document.getElementById('friendDistances').innerHTML=html;
+}
+
+// Distance formula
+function distance(lat1, lon1, lat2, lon2){
+  const R = 6371000;
+  const dLat = (lat2-lat1)*Math.PI/180;
+  const dLon = (lon2-lon1)*Math.PI/180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  const c = 2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+  return R*c;
+}
+</script>
+
+</body>
+</html>
